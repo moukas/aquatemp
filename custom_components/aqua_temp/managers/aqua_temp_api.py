@@ -254,20 +254,18 @@ class AquaTempAPI:
         param_device_code = self._config_manager.get_api_param(APIParam.DeviceCode)
         param_protocol_code = self._config_manager.get_api_param(APIParam.ProtocolCode)
 
-        request_data = {
-            DEVICE_CONTROL_PARAM: [
+        control_params = []
+
+        for protocol_code in dict.fromkeys([target_temperature_pc, set_temp_pc_key]):
+            control_params.append(
                 {
                     param_device_code: device_code,
-                    param_protocol_code: target_temperature_pc,
+                    param_protocol_code: protocol_code,
                     DEVICE_CONTROL_VALUE: temperature,
-                },
-                {
-                    param_device_code: device_code,
-                    param_protocol_code: set_temp_pc_key,
-                    DEVICE_CONTROL_VALUE: temperature,
-                },
-            ]
-        }
+                }
+            )
+
+        request_data = {DEVICE_CONTROL_PARAM: control_params}
 
         await self._perform_action(request_data, set_temp_pc_key)
 
@@ -457,10 +455,22 @@ class AquaTempAPI:
         param_device_code = self._config_manager.get_api_param(APIParam.DeviceCode)
         param_object_result = self._config_manager.get_api_param(APIParam.ObjectResult)
         param_is_fault = self._config_manager.get_api_param(APIParam.IsFault)
+        param_error_msg = self._config_manager.get_api_param(APIParam.ErrorMessage)
+        param_error_code = self._config_manager.get_api_param(APIParam.ErrorCode)
 
         data = {param_device_code: device_code}
 
         device_status_response = await self._post_request(Endpoints.DeviceStatus, data)
+        error_msg = device_status_response.get(param_error_msg)
+
+        if error_msg != "Success":
+            error_code = device_status_response.get(param_error_code)
+            if error_code == "-100":
+                raise InvalidTokenError(f"Fetch status for device {device_code}")
+
+            _LOGGER.error(f"Failed to fetch device status, Error: {error_msg}")
+            return
+
         object_result = device_status_response.get(param_object_result, {})
 
         is_fault = object_result.get(param_is_fault, str(False))
@@ -534,6 +544,12 @@ class AquaTempAPI:
 
         object_result = user_info_response.get(param_object_result, {})
         user_id = object_result.get(param_user_id)
+
+        if user_id is None:
+            user_id = self._login_details.get(param_user_id)
+
+        if user_id is None:
+            _LOGGER.warning("User info did not include a user id, using login response only")
 
         for device_list_url in DEVICE_LISTS:
             request_data = {}
@@ -636,41 +652,16 @@ class AquaTempAPI:
         return current_temperature
 
     def get_device_minimum_temperature(self, device_code: str) -> float | None:
-        device_data = self.get_device_data(device_code)
-
         hvac_mode = self.get_device_hvac_mode(device_code)
-        key = self._config_manager.get_hvac_mode_pc_key(
-            device_code, hvac_mode, CONFIG_HVAC_MINIMUM
-        )
+        minimum_temperature, _ = self._get_temperature_limits(device_code, hvac_mode)
 
-        temperature = device_data.get(key)
-
-        if temperature == "":
-            temperature = None
-
-        if temperature is not None:
-            temperature = float(str(temperature))
-
-        return temperature
+        return minimum_temperature
 
     def get_device_maximum_temperature(self, device_code: str) -> float | None:
-        device_data = self.get_device_data(device_code)
-
         hvac_mode = self.get_device_hvac_mode(device_code)
+        _, maximum_temperature = self._get_temperature_limits(device_code, hvac_mode)
 
-        key = self._config_manager.get_hvac_mode_pc_key(
-            device_code, hvac_mode, CONFIG_HVAC_MAXIMUM
-        )
-
-        temperature = device_data.get(key)
-
-        if temperature == "":
-            temperature = None
-
-        if temperature is not None:
-            temperature = float(str(temperature))
-
-        return temperature
+        return maximum_temperature
 
     def get_device_hvac_mode(self, device_code: str) -> HVACMode:
         device_data = self.get_device_data(device_code)
@@ -680,7 +671,15 @@ class AquaTempAPI:
         hvac_mode = self._config_manager.get_hvac_reverse_mapping(
             device_code, device_mode
         )
-        result = HVACMode(hvac_mode)
+        if hvac_mode is None:
+            _LOGGER.debug(
+                "Unknown HVAC mode for device %s, raw value: %s",
+                device_code,
+                device_mode,
+            )
+            result = HVACMode.OFF
+        else:
+            result = HVACMode(hvac_mode)
 
         return result
 
@@ -703,6 +702,45 @@ class AquaTempAPI:
         is_on = power == POWER_MODE_ON
 
         return is_on
+
+    def _get_temperature_limits(
+        self, device_code: str, hvac_mode: HVACMode
+    ) -> tuple[float | None, float | None]:
+        device_data = self.get_device_data(device_code)
+
+        minimum_key = self._config_manager.get_hvac_mode_pc_key(
+            device_code, hvac_mode, CONFIG_HVAC_MINIMUM
+        )
+        maximum_key = self._config_manager.get_hvac_mode_pc_key(
+            device_code, hvac_mode, CONFIG_HVAC_MAXIMUM
+        )
+
+        minimum_temperature = self._get_float_value(device_data, minimum_key)
+        maximum_temperature = self._get_float_value(device_data, maximum_key)
+
+        if (
+            minimum_temperature is not None
+            and maximum_temperature is not None
+            and minimum_temperature > maximum_temperature
+        ):
+            minimum_temperature, maximum_temperature = (
+                maximum_temperature,
+                minimum_temperature,
+            )
+
+        return minimum_temperature, maximum_temperature
+
+    @staticmethod
+    def _get_float_value(device_data: dict | None, key: str | None) -> float | None:
+        if device_data is None or key is None:
+            return None
+
+        value = device_data.get(key)
+
+        if value == "" or value is None:
+            return None
+
+        return float(str(value))
 
     def _get_target_temperature_protocol_code(
         self, device_code: str, hvac_mode: HVACMode
